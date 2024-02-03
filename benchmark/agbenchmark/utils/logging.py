@@ -1,30 +1,30 @@
+from __future__ import annotations
+
 import logging
-import sys
 
 from colorama import Fore, Style
-from openai._base_client import log as openai_logger
 
-SIMPLE_LOG_FORMAT = "%(asctime)s %(levelname)s  %(message)s"
-DEBUG_LOG_FORMAT = (
-    "%(asctime)s.%(msecs)03d %(levelname)s %(filename)s:%(lineno)d  %(message)s"
-)
+SIMPLE_LOG_FORMAT = "[%(asctime)s] %(levelname)s %(message)s"
+DEBUG_LOG_FORMAT = "[%(asctime)s] %(levelname)s %(filename)s:%(lineno)03d  %(message)s"
 
 
-def configure_root_logger():
-    console_formatter = FancyConsoleFormatter(SIMPLE_LOG_FORMAT)
+def configure_logging(
+    level: int = logging.INFO,
+) -> None:
+    """Configure the native logging module."""
 
-    stdout = logging.StreamHandler(stream=sys.stdout)
-    stdout.setLevel(logging.DEBUG)
-    stdout.addFilter(BelowLevelFilter(logging.WARNING))
-    stdout.setFormatter(console_formatter)
-    stderr = logging.StreamHandler()
-    stderr.setLevel(logging.WARNING)
-    stderr.setFormatter(console_formatter)
+    # Auto-adjust default log format based on log level
+    log_format = DEBUG_LOG_FORMAT if level == logging.DEBUG else SIMPLE_LOG_FORMAT
 
-    logging.basicConfig(level=logging.DEBUG, handlers=[stdout, stderr])
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(FancyConsoleFormatter(log_format))
 
-    # Disable debug logging from OpenAI library
-    openai_logger.setLevel(logging.WARNING)
+    # Configure the root logger
+    logging.basicConfig(
+        level=level,
+        format=log_format,
+        handlers=[console_handler],
+    )
 
 
 class FancyConsoleFormatter(logging.Formatter):
@@ -54,6 +54,9 @@ class FancyConsoleFormatter(logging.Formatter):
         elif not type(record.msg) is str:
             record.msg = str(record.msg)
 
+        # Justify the level name to 5 characters minimum
+        record.levelname = record.levelname.ljust(5)
+
         # Determine default color based on error level
         level_color = ""
         if record.levelno in self.LEVEL_COLOR_MAP:
@@ -69,14 +72,3 @@ class FancyConsoleFormatter(logging.Formatter):
             record.msg = f"{color}{record.msg}{Style.RESET_ALL}"
 
         return super().format(record)
-
-
-class BelowLevelFilter(logging.Filter):
-    """Filter for logging levels below a certain threshold."""
-
-    def __init__(self, below_level: int):
-        super().__init__()
-        self.below_level = below_level
-
-    def filter(self, record: logging.LogRecord):
-        return record.levelno < self.below_level

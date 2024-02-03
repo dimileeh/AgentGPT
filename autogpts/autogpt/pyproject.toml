@@ -24,7 +24,7 @@ serve = "autogpt.app.cli:serve"
 python = "^3.10"
 auto-gpt-plugin-template = {git = "https://github.com/Significant-Gravitas/Auto-GPT-Plugin-Template", rev = "0.1.0"}
 # autogpt-forge = { path = "../forge" }
-autogpt-forge = {git = "https://github.com/Significant-Gravitas/AutoGPT.git", subdirectory = "autogpts/forge"}
+autogpt-forge = {git = "https://github.com/Significant-Gravitas/AutoGPT.git", rev = "b238aba", subdirectory = "autogpts/forge"}
 beautifulsoup4 = "^4.12.2"
 boto3 = "^1.33.6"
 charset-normalizer = "^3.1.0"
@@ -43,7 +43,7 @@ hypercorn = "^0.14.4"
 inflection = "*"
 jsonschema = "*"
 numpy = "*"
-openai = "^0.27.10"
+openai = "^1.7.2"
 orjson = "^3.8.10"
 Pillow = "*"
 pinecone-client = "^2.2.1"
@@ -60,6 +60,7 @@ redis = "*"
 requests = "*"
 selenium = "^4.11.2"
 spacy = "^3.0.0"
+tenacity = "^8.2.2"
 tiktoken = "^0.5.0"
 webdriver-manager = "*"
 

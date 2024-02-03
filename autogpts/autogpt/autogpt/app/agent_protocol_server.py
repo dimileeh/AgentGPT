@@ -1,4 +1,3 @@
-import copy
 import logging
 import os
 import pathlib
@@ -34,6 +33,8 @@ from autogpt.commands.system import finish
 from autogpt.commands.user_interaction import ask_user
 from autogpt.config import Config
 from autogpt.core.resource.model_providers import ChatModelProvider
+from autogpt.core.resource.model_providers.openai import OpenAIProvider
+from autogpt.core.resource.model_providers.schema import ModelProviderBudget
 from autogpt.file_workspace import (
     FileWorkspace,
     FileWorkspaceBackendName,
@@ -46,6 +47,8 @@ logger = logging.getLogger(__name__)
 
 
 class AgentProtocolServer:
+    _task_budgets: dict[str, ModelProviderBudget]
+
     def __init__(
         self,
         app_config: Config,
@@ -56,6 +59,7 @@ class AgentProtocolServer:
         self.db = database
         self.llm_provider = llm_provider
         self.agent_manager = AgentManager(app_data_dir=app_config.app_data_dir)
+        self._task_budgets = {}
 
     async def start(self, port: int = 8000, router: APIRouter = base_router):
         """Start the agent server."""
@@ -127,10 +131,13 @@ class AgentProtocolServer:
             app_config=self.app_config,
             llm_provider=self._get_task_llm_provider(task),
         )
+
+        # Assign an ID and a folder to the Agent and persist it
         agent_id = task_agent.state.agent_id = task_agent_id(task.task_id)
         logger.debug(f"New agent ID: {agent_id}")
         task_agent.attach_fs(self.app_config.app_data_dir / "agents" / agent_id)
         task_agent.state.save_to_json_file(task_agent.file_manager.state_file_path)
+
         return task
 
     async def list_tasks(self, page: int = 1, pageSize: int = 10) -> TaskListResponse:
@@ -213,12 +220,8 @@ class AgentProtocolServer:
         # Execute previously proposed action
         if execute_command:
             assert execute_command_args is not None
-            agent.workspace.on_write_file = lambda path: self.db.create_artifact(
-                task_id=step.task_id,
-                step_id=step.step_id,
-                file_name=path.parts[-1],
-                agent_created=True,
-                relative_path=str(path),
+            agent.workspace.on_write_file = lambda path: self._on_agent_write_file(
+                task=task, step=step, relative_path=path
             )
 
             if step.is_last and execute_command == finish.__name__:
@@ -227,6 +230,10 @@ class AgentProtocolServer:
                     task_id=task_id,
                     step_id=step.step_id,
                     output=execute_command_args["reason"],
+                )
+                logger.info(
+                    f"Total LLM cost for task {task_id}: "
+                    f"${round(agent.llm_provider.get_incurred_cost(), 2)}"
                 )
                 return step
 
@@ -314,8 +321,36 @@ class AgentProtocolServer:
             additional_output=additional_output,
         )
 
+        logger.debug(
+            f"Running total LLM cost for task {task_id}: "
+            f"${round(agent.llm_provider.get_incurred_cost(), 3)}"
+        )
         agent.state.save_to_json_file(agent.file_manager.state_file_path)
         return step
+
+    async def _on_agent_write_file(
+        self, task: Task, step: Step, relative_path: pathlib.Path
+    ) -> None:
+        """
+        Creates an Artifact for the written file, or updates the Artifact if it exists.
+        """
+        if relative_path.is_absolute():
+            raise ValueError(f"File path '{relative_path}' is not relative")
+        for a in task.artifacts or []:
+            if a.relative_path == str(relative_path):
+                logger.debug(f"Updating Artifact after writing to existing file: {a}")
+                if not a.agent_created:
+                    await self.db.update_artifact(a.artifact_id, agent_created=True)
+                break
+        else:
+            logger.debug(f"Creating Artifact for new file '{relative_path}'")
+            await self.db.create_artifact(
+                task_id=step.task_id,
+                step_id=step.step_id,
+                file_name=relative_path.parts[-1],
+                agent_created=True,
+                relative_path=str(relative_path),
+            )
 
     async def get_step(self, task_id: str, step_id: str) -> Step:
         """
@@ -339,7 +374,6 @@ class AgentProtocolServer:
         """
         Create an artifact for the task.
         """
-        data = None
         file_name = file.filename or str(uuid4())
         data = b""
         while contents := file.file.read(1024 * 1024):
@@ -415,16 +449,32 @@ class AgentProtocolServer:
         """
         Configures the LLM provider with headers to link outgoing requests to the task.
         """
-        task_llm_provider = copy.deepcopy(self.llm_provider)
-        _extra_request_headers = task_llm_provider._configuration.extra_request_headers
+        task_llm_budget = self._task_budgets.get(
+            task.task_id, self.llm_provider.default_settings.budget.copy(deep=True)
+        )
 
+        task_llm_provider_config = self.llm_provider._configuration.copy(deep=True)
+        _extra_request_headers = task_llm_provider_config.extra_request_headers
         _extra_request_headers["AP-TaskID"] = task.task_id
         if step_id:
             _extra_request_headers["AP-StepID"] = step_id
         if task.additional_input and (user_id := task.additional_input.get("user_id")):
             _extra_request_headers["AutoGPT-UserID"] = user_id
 
-        return task_llm_provider
+        task_llm_provider = None
+        if isinstance(self.llm_provider, OpenAIProvider):
+            settings = self.llm_provider._settings.copy()
+            settings.budget = task_llm_budget
+            settings.configuration = task_llm_provider_config  # type: ignore
+            task_llm_provider = OpenAIProvider(
+                settings=settings,
+                logger=logger.getChild(f"Task-{task.task_id}_OpenAIProvider"),
+            )
+
+        if task_llm_provider and task_llm_provider._budget:
+            self._task_budgets[task.task_id] = task_llm_provider._budget
+
+        return task_llm_provider or self.llm_provider
 
 
 def task_agent_id(task_id: str | int) -> str:

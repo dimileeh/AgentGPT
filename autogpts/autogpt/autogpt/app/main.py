@@ -365,10 +365,16 @@ async def run_auto_gpt_server(
         database_string=os.getenv("AP_SERVER_DB_URL", "sqlite:///data/ap_server.db"),
         debug_enabled=debug,
     )
+    port: int = int(os.getenv("AP_SERVER_PORT", default=8000))
     server = AgentProtocolServer(
         app_config=config, database=database, llm_provider=llm_provider
     )
-    await server.start()
+    await server.start(port=port)
+
+    logging.getLogger().info(
+        f"Total OpenAI session cost: "
+        f"${round(sum(b.total_cost for b in server._task_budgets.values()), 2)}"
+    )
 
 
 def _configure_openai_provider(config: Config) -> OpenAIProvider:
