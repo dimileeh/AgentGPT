@@ -1,21 +1,18 @@
 import json
 import logging
 
-from autogpt.config import AIDirectives, AIProfile, Config
-from autogpt.core.configuration import SystemConfiguration, UserConfigurable
-from autogpt.core.prompting import (
-    ChatPrompt,
-    LanguageModelClassification,
-    PromptStrategy,
-)
-from autogpt.core.prompting.utils import json_loads
-from autogpt.core.resource.model_providers.schema import (
+from forge.config.ai_directives import AIDirectives
+from forge.config.ai_profile import AIProfile
+from forge.config.config import Config
+from forge.llm.prompting import ChatPrompt, LanguageModelClassification, PromptStrategy
+from forge.llm.providers.schema import (
     AssistantChatMessage,
     ChatMessage,
     ChatModelProvider,
     CompletionModelFunction,
 )
-from autogpt.core.utils.json_schema import JSONSchema
+from forge.models.config import SystemConfiguration, UserConfigurable
+from forge.models.json_schema import JSONSchema
 
 logger = logging.getLogger(__name__)
 
@@ -203,9 +200,7 @@ class AgentProfileGenerator(PromptStrategy):
                     f"LLM did not call {self._create_agent_function.name} function; "
                     "agent profile creation failed"
                 )
-            arguments: object = json_loads(
-                response_content.tool_calls[0].function.arguments
-            )
+            arguments: object = response_content.tool_calls[0].function.arguments
             ai_profile = AIProfile(
                 ai_name=arguments.get("name"),
                 ai_role=arguments.get("description"),

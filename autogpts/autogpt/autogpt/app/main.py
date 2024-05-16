@@ -1,6 +1,7 @@
 """
 The application entry point. Can be invoked by a CLI or any other front end application.
 """
+
 import enum
 import logging
 import math
@@ -13,35 +14,37 @@ from types import FrameType
 from typing import TYPE_CHECKING, Optional
 
 from colorama import Fore, Style
-from forge.sdk.db import AgentDB
-
-if TYPE_CHECKING:
-    from autogpt.agents.agent import Agent
+from forge.components.code_executor import (
+    is_docker_available,
+    we_are_running_in_a_docker_container,
+)
+from forge.config.ai_directives import AIDirectives
+from forge.config.ai_profile import AIProfile
+from forge.config.config import Config, ConfigBuilder, assert_config_has_openai_api_key
+from forge.db import AgentDB
+from forge.file_storage import FileStorageBackendName, get_storage
+from forge.llm.providers import MultiProvider
+from forge.logging.config import configure_logging
+from forge.logging.helpers import print_attribute, speak
+from forge.models.action import ActionInterruptedByHuman, ActionProposal
+from forge.models.utils import ModelWithSummary
+from forge.utils.const import FINISH_COMMAND
+from forge.utils.exceptions import AgentTerminated, InvalidAgentResponseError
 
 from autogpt.agent_factory.configurators import configure_agent_with_state, create_agent
 from autogpt.agent_factory.profile_generator import generate_agent_profile_for_task
 from autogpt.agent_manager import AgentManager
-from autogpt.agents import AgentThoughts, CommandArgs, CommandName
-from autogpt.agents.utils.exceptions import AgentTerminated, InvalidAgentResponseError
-from autogpt.config import (
-    AIDirectives,
-    AIProfile,
-    Config,
-    ConfigBuilder,
-    assert_config_has_openai_api_key,
-)
-from autogpt.core.resource.model_providers.openai import OpenAIProvider
+from autogpt.agents.prompt_strategies.one_shot import AssistantThoughts
 from autogpt.core.runner.client_lib.utils import coroutine
-from autogpt.logs.config import configure_chat_plugins, configure_logging
-from autogpt.logs.helpers import print_attribute, speak
-from autogpt.plugins import scan_plugins
-from scripts.install_plugin_deps import install_plugin_dependencies
+
+if TYPE_CHECKING:
+    from autogpt.agents.agent import Agent
 
 from .configurator import apply_overrides_to_config
+from .input import clean_input
 from .setup import apply_overrides_to_ai_settings, interactively_revise_ai_settings
 from .spinner import Spinner
 from .utils import (
-    clean_input,
     get_legal_warning,
     markdown_to_ansi_style,
     print_git_branch_info,
@@ -76,23 +79,38 @@ async def run_auto_gpt(
     best_practices: Optional[list[str]] = None,
     override_directives: bool = False,
 ):
+    # Set up configuration
     config = ConfigBuilder.build_config_from_env()
+    # Storage
+    local = config.file_storage_backend == FileStorageBackendName.LOCAL
+    restrict_to_root = not local or config.restrict_to_workspace
+    file_storage = get_storage(
+        config.file_storage_backend, root_path="data", restrict_to_root=restrict_to_root
+    )
+    file_storage.initialize()
+
+    # Set up logging module
+    if speak:
+        config.tts_config.speak_mode = True
+    configure_logging(
+        debug=debug,
+        level=log_level,
+        log_format=log_format,
+        log_file_format=log_file_format,
+        config=config.logging,
+        tts_config=config.tts_config,
+    )
 
     # TODO: fill in llm values here
     assert_config_has_openai_api_key(config)
 
-    apply_overrides_to_config(
+    await apply_overrides_to_config(
         config=config,
         continuous=continuous,
         continuous_limit=continuous_limit,
         ai_settings_file=ai_settings,
         prompt_settings_file=prompt_settings,
         skip_reprompt=skip_reprompt,
-        speak=speak,
-        debug=debug,
-        log_level=log_level,
-        log_format=log_format,
-        log_file_format=log_file_format,
         gpt3only=gpt3only,
         gpt4only=gpt4only,
         browser_name=browser_name,
@@ -100,13 +118,7 @@ async def run_auto_gpt(
         skip_news=skip_news,
     )
 
-    # Set up logging module
-    configure_logging(
-        **config.logging.dict(),
-        tts_config=config.tts_config,
-    )
-
-    llm_provider = _configure_openai_provider(config)
+    llm_provider = _configure_llm_provider(config)
 
     logger = logging.getLogger(__name__)
 
@@ -140,15 +152,17 @@ async def run_auto_gpt(
             print_attribute("Using Prompt Settings File", prompt_settings)
         if config.allow_downloads:
             print_attribute("Native Downloading", "ENABLED")
-
-    if install_plugin_deps:
-        install_plugin_dependencies()
-
-    config.plugins = scan_plugins(config)
-    configure_chat_plugins(config)
+        if we_are_running_in_a_docker_container() or is_docker_available():
+            print_attribute("Code Execution", "ENABLED")
+        else:
+            print_attribute(
+                "Code Execution",
+                "DISABLED (Docker unavailable)",
+                title_color=Fore.YELLOW,
+            )
 
     # Let user choose an existing agent to run
-    agent_manager = AgentManager(config.app_data_dir)
+    agent_manager = AgentManager(file_storage)
     existing_agents = agent_manager.list_agents()
     load_existing_agent = ""
     if existing_agents:
@@ -156,14 +170,16 @@ async def run_auto_gpt(
             "Existing agents\n---------------\n"
             + "\n".join(f"{i} - {id}" for i, id in enumerate(existing_agents, 1))
         )
-        load_existing_agent = await clean_input(
-            config,
+        load_existing_agent = clean_input(
             "Enter the number or name of the agent to run,"
             " or hit enter to create a new one:",
         )
-        if re.match(r"^\d+$", load_existing_agent):
+        if re.match(r"^\d+$", load_existing_agent.strip()) and 0 < int(
+            load_existing_agent
+        ) <= len(existing_agents):
             load_existing_agent = existing_agents[int(load_existing_agent) - 1]
-        elif load_existing_agent and load_existing_agent not in existing_agents:
+
+        if load_existing_agent != "" and load_existing_agent not in existing_agents:
             logger.info(
                 f"Unknown agent '{load_existing_agent}', "
                 f"creating a new one instead.",
@@ -179,21 +195,20 @@ async def run_auto_gpt(
     # Resume an Existing Agent #
     ############################
     if load_existing_agent:
-        agent_state = agent_manager.retrieve_state(load_existing_agent)
+        agent_state = None
         while True:
-            answer = await clean_input(config, "Resume? [Y/n]")
-            if answer.lower() == "y":
+            answer = clean_input("Resume? [Y/n]")
+            if answer == "" or answer.lower() == "y":
+                agent_state = agent_manager.load_agent_state(load_existing_agent)
                 break
             elif answer.lower() == "n":
-                agent_state = None
                 break
-            else:
-                print("Please respond with 'y' or 'n'")
 
     if agent_state:
         agent = configure_agent_with_state(
             state=agent_state,
             app_config=config,
+            file_storage=file_storage,
             llm_provider=llm_provider,
         )
         apply_overrides_to_ai_settings(
@@ -206,6 +221,21 @@ async def run_auto_gpt(
             best_practices=best_practices,
             replace_directives=override_directives,
         )
+
+        if (
+            (current_episode := agent.event_history.current_episode)
+            and current_episode.action.use_tool.name == FINISH_COMMAND
+            and not current_episode.result
+        ):
+            # Agent was resumed after `finish` -> rewrite result of `finish` action
+            finish_reason = current_episode.action.use_tool.arguments["reason"]
+            print(f"Agent previously self-terminated; reason: '{finish_reason}'")
+            new_assignment = clean_input(
+                "Please give a follow-up question or assignment:"
+            )
+            agent.event_history.register_result(
+                ActionInterruptedByHuman(feedback=new_assignment)
+            )
 
         # If any of these are specified as arguments,
         #  assume the user doesn't want to revise them
@@ -230,11 +260,13 @@ async def run_auto_gpt(
     # Set up a new Agent #
     ######################
     if not agent:
-        task = await clean_input(
-            config,
-            "Enter the task that you want AutoGPT to execute,"
-            " with as much detail as possible:",
-        )
+        task = ""
+        while task.strip() == "":
+            task = clean_input(
+                "Enter the task that you want AutoGPT to execute,"
+                " with as much detail as possible:",
+            )
+
         base_ai_directives = AIDirectives.from_file(config.prompt_settings_file)
 
         ai_profile, task_oriented_ai_directives = await generate_agent_profile_for_task(
@@ -274,19 +306,22 @@ async def run_auto_gpt(
             logger.info("AI config overrides specified through CLI; skipping revision")
 
         agent = create_agent(
+            agent_id=agent_manager.generate_id(ai_profile.ai_name),
             task=task,
             ai_profile=ai_profile,
             directives=ai_directives,
             app_config=config,
+            file_storage=file_storage,
             llm_provider=llm_provider,
         )
-        agent.attach_fs(agent_manager.get_agent_dir(agent.state.agent_id))
 
-        if not agent.config.allow_fs_access:
+        file_manager = agent.file_manager
+
+        if file_manager and not agent.config.allow_fs_access:
             logger.info(
                 f"{Fore.YELLOW}"
                 "NOTE: All files/directories created by this agent can be found "
-                f"inside its workspace at:{Fore.RESET} {agent.workspace.root}",
+                f"inside its workspace at:{Fore.RESET} {file_manager.workspace.root}",
                 extra={"preserve_color": True},
             )
 
@@ -300,23 +335,14 @@ async def run_auto_gpt(
         logger.info(f"Saving state of {agent_id}...")
 
         # Allow user to Save As other ID
-        save_as_id = (
-            await clean_input(
-                config,
-                f"Press enter to save as '{agent_id}',"
-                " or enter a different ID to save to:",
-            )
-            or agent_id
+        save_as_id = clean_input(
+            f"Press enter to save as '{agent_id}',"
+            " or enter a different ID to save to:",
         )
-        if save_as_id and save_as_id != agent_id:
-            agent.set_id(
-                new_id=save_as_id,
-                new_agent_dir=agent_manager.get_agent_dir(save_as_id),
-            )
-            # TODO: clone workspace if user wants that
-            # TODO: ... OR allow many-to-one relations of agents and workspaces
-
-        agent.state.save_to_json_file(agent.file_manager.state_file_path)
+        # TODO: allow many-to-one relations of agents and workspaces
+        await agent.file_manager.save_state(
+            save_as_id.strip() if not save_as_id.isspace() else None
+        )
 
 
 @coroutine
@@ -335,35 +361,37 @@ async def run_auto_gpt_server(
     from .agent_protocol_server import AgentProtocolServer
 
     config = ConfigBuilder.build_config_from_env()
+    # Storage
+    local = config.file_storage_backend == FileStorageBackendName.LOCAL
+    restrict_to_root = not local or config.restrict_to_workspace
+    file_storage = get_storage(
+        config.file_storage_backend, root_path="data", restrict_to_root=restrict_to_root
+    )
+    file_storage.initialize()
+
+    # Set up logging module
+    configure_logging(
+        debug=debug,
+        level=log_level,
+        log_format=log_format,
+        log_file_format=log_file_format,
+        config=config.logging,
+        tts_config=config.tts_config,
+    )
 
     # TODO: fill in llm values here
     assert_config_has_openai_api_key(config)
 
-    apply_overrides_to_config(
+    await apply_overrides_to_config(
         config=config,
         prompt_settings_file=prompt_settings,
-        debug=debug,
-        log_level=log_level,
-        log_format=log_format,
-        log_file_format=log_file_format,
         gpt3only=gpt3only,
         gpt4only=gpt4only,
         browser_name=browser_name,
         allow_downloads=allow_downloads,
     )
 
-    # Set up logging module
-    configure_logging(
-        **config.logging.dict(),
-        tts_config=config.tts_config,
-    )
-
-    llm_provider = _configure_openai_provider(config)
-
-    if install_plugin_deps:
-        install_plugin_dependencies()
-
-    config.plugins = scan_plugins(config)
+    llm_provider = _configure_llm_provider(config)
 
     # Set up & start server
     database = AgentDB(
@@ -372,7 +400,10 @@ async def run_auto_gpt_server(
     )
     port: int = int(os.getenv("AP_SERVER_PORT", default=8000))
     server = AgentProtocolServer(
-        app_config=config, database=database, llm_provider=llm_provider
+        app_config=config,
+        database=database,
+        file_storage=file_storage,
+        llm_provider=llm_provider,
     )
     await server.start(port=port)
 
@@ -382,24 +413,12 @@ async def run_auto_gpt_server(
     )
 
 
-def _configure_openai_provider(config: Config) -> OpenAIProvider:
-    """Create a configured OpenAIProvider object.
-
-    Args:
-        config: The program's configuration.
-
-    Returns:
-        A configured OpenAIProvider object.
-    """
-    if config.openai_credentials is None:
-        raise RuntimeError("OpenAI key is not configured")
-
-    openai_settings = OpenAIProvider.default_settings.copy(deep=True)
-    openai_settings.credentials = config.openai_credentials
-    return OpenAIProvider(
-        settings=openai_settings,
-        logger=logging.getLogger("OpenAIProvider"),
-    )
+def _configure_llm_provider(config: Config) -> MultiProvider:
+    multi_provider = MultiProvider()
+    for model in [config.smart_llm, config.fast_llm]:
+        # Ensure model providers for configured LLMs are available
+        multi_provider.get_model_provider(model)
+    return multi_provider
 
 
 def _get_cycle_budget(continuous_mode: bool, continuous_limit: int) -> int | float:
@@ -493,11 +512,7 @@ async def run_interaction_loop(
         # Have the agent determine the next action to take.
         with spinner:
             try:
-                (
-                    command_name,
-                    command_args,
-                    assistant_reply_dict,
-                ) = await agent.propose_action()
+                action_proposal = await agent.propose_action()
             except InvalidAgentResponseError as e:
                 logger.warning(f"The agent's thoughts could not be parsed: {e}")
                 consecutive_failures += 1
@@ -520,9 +535,7 @@ async def run_interaction_loop(
         # Print the assistant's thoughts and the next command to the user.
         update_user(
             ai_profile,
-            command_name,
-            command_args,
-            assistant_reply_dict,
+            action_proposal,
             speak_mode=legacy_config.tts_config.speak_mode,
         )
 
@@ -531,12 +544,12 @@ async def run_interaction_loop(
         ##################
         handle_stop_signal()
         if cycles_remaining == 1:  # Last cycle
-            user_feedback, user_input, new_cycles_remaining = await get_user_feedback(
+            feedback_type, feedback, new_cycles_remaining = await get_user_feedback(
                 legacy_config,
                 ai_profile,
             )
 
-            if user_feedback == UserFeedback.AUTHORIZE:
+            if feedback_type == UserFeedback.AUTHORIZE:
                 if new_cycles_remaining is not None:
                     # Case 1: User is altering the cycle budget.
                     if cycle_budget > 1:
@@ -560,13 +573,13 @@ async def run_interaction_loop(
                     "-=-=-=-=-=-=-= COMMAND AUTHORISED BY USER -=-=-=-=-=-=-=",
                     extra={"color": Fore.MAGENTA},
                 )
-            elif user_feedback == UserFeedback.EXIT:
+            elif feedback_type == UserFeedback.EXIT:
                 logger.warning("Exiting...")
                 exit()
             else:  # user_feedback == UserFeedback.TEXT
-                command_name = "human_feedback"
+                pass
         else:
-            user_input = ""
+            feedback = ""
             # First log new-line so user can differentiate sections better in console
             print()
             if cycles_remaining != math.inf:
@@ -581,33 +594,31 @@ async def run_interaction_loop(
         # Decrement the cycle counter first to reduce the likelihood of a SIGINT
         # happening during command execution, setting the cycles remaining to 1,
         # and then having the decrement set it to 0, exiting the application.
-        if command_name != "human_feedback":
+        if not feedback:
             cycles_remaining -= 1
 
-        if not command_name:
+        if not action_proposal.use_tool:
             continue
 
         handle_stop_signal()
 
-        if command_name:
-            result = await agent.execute(command_name, command_args, user_input)
+        if not feedback:
+            result = await agent.execute(action_proposal)
+        else:
+            result = await agent.do_not_execute(action_proposal, feedback)
 
-            if result.status == "success":
-                logger.info(
-                    result, extra={"title": "SYSTEM:", "title_color": Fore.YELLOW}
-                )
-            elif result.status == "error":
-                logger.warning(
-                    f"Command {command_name} returned an error: "
-                    f"{result.error or result.reason}"
-                )
+        if result.status == "success":
+            logger.info(result, extra={"title": "SYSTEM:", "title_color": Fore.YELLOW})
+        elif result.status == "error":
+            logger.warning(
+                f"Command {action_proposal.use_tool.name} returned an error: "
+                f"{result.error or result.reason}"
+            )
 
 
 def update_user(
     ai_profile: AIProfile,
-    command_name: CommandName,
-    command_args: CommandArgs,
-    assistant_reply_dict: AgentThoughts,
+    action_proposal: "ActionProposal",
     speak_mode: bool = False,
 ) -> None:
     """Prints the assistant's thoughts and the next command to the user.
@@ -623,18 +634,19 @@ def update_user(
 
     print_assistant_thoughts(
         ai_name=ai_profile.ai_name,
-        assistant_reply_json_valid=assistant_reply_dict,
+        thoughts=action_proposal.thoughts,
         speak_mode=speak_mode,
     )
 
     if speak_mode:
-        speak(f"I want to execute {command_name}")
+        speak(f"I want to execute {action_proposal.use_tool.name}")
 
     # First log new-line so user can differentiate sections better in console
     print()
+    safe_tool_name = remove_ansi_escape(action_proposal.use_tool.name)
     logger.info(
-        f"COMMAND = {Fore.CYAN}{remove_ansi_escape(command_name)}{Style.RESET_ALL}  "
-        f"ARGUMENTS = {Fore.CYAN}{command_args}{Style.RESET_ALL}",
+        f"COMMAND = {Fore.CYAN}{safe_tool_name}{Style.RESET_ALL}  "
+        f"ARGUMENTS = {Fore.CYAN}{action_proposal.use_tool.arguments}{Style.RESET_ALL}",
         extra={
             "title": "NEXT ACTION:",
             "title_color": Fore.CYAN,
@@ -675,12 +687,7 @@ async def get_user_feedback(
 
     while user_feedback is None:
         # Get input from user
-        if config.chat_messages_enabled:
-            console_input = await clean_input(config, "Waiting for your response...")
-        else:
-            console_input = await clean_input(
-                config, Fore.MAGENTA + "Input:" + Style.RESET_ALL
-            )
+        console_input = clean_input(Fore.MAGENTA + "Input:" + Style.RESET_ALL)
 
         # Parse user input
         if console_input.lower().strip() == config.authorise_key:
@@ -708,56 +715,59 @@ async def get_user_feedback(
 
 def print_assistant_thoughts(
     ai_name: str,
-    assistant_reply_json_valid: dict,
+    thoughts: str | ModelWithSummary | AssistantThoughts,
     speak_mode: bool = False,
 ) -> None:
     logger = logging.getLogger(__name__)
 
-    assistant_thoughts_reasoning = None
-    assistant_thoughts_plan = None
-    assistant_thoughts_speak = None
-    assistant_thoughts_criticism = None
-
-    assistant_thoughts = assistant_reply_json_valid.get("thoughts", {})
-    assistant_thoughts_text = remove_ansi_escape(assistant_thoughts.get("text", ""))
-    if assistant_thoughts:
-        assistant_thoughts_reasoning = remove_ansi_escape(
-            assistant_thoughts.get("reasoning", "")
-        )
-        assistant_thoughts_plan = remove_ansi_escape(assistant_thoughts.get("plan", ""))
-        assistant_thoughts_criticism = remove_ansi_escape(
-            assistant_thoughts.get("self_criticism", "")
-        )
-        assistant_thoughts_speak = remove_ansi_escape(
-            assistant_thoughts.get("speak", "")
-        )
-    print_attribute(
-        f"{ai_name.upper()} THOUGHTS", assistant_thoughts_text, title_color=Fore.YELLOW
+    thoughts_text = remove_ansi_escape(
+        thoughts.text
+        if isinstance(thoughts, AssistantThoughts)
+        else thoughts.summary()
+        if isinstance(thoughts, ModelWithSummary)
+        else thoughts
     )
-    print_attribute("REASONING", assistant_thoughts_reasoning, title_color=Fore.YELLOW)
-    if assistant_thoughts_plan:
-        print_attribute("PLAN", "", title_color=Fore.YELLOW)
-        # If it's a list, join it into a string
-        if isinstance(assistant_thoughts_plan, list):
-            assistant_thoughts_plan = "\n".join(assistant_thoughts_plan)
-        elif isinstance(assistant_thoughts_plan, dict):
-            assistant_thoughts_plan = str(assistant_thoughts_plan)
-
-        # Split the input_string using the newline character and dashes
-        lines = assistant_thoughts_plan.split("\n")
-        for line in lines:
-            line = line.lstrip("- ")
-            logger.info(line.strip(), extra={"title": "- ", "title_color": Fore.GREEN})
     print_attribute(
-        "CRITICISM", f"{assistant_thoughts_criticism}", title_color=Fore.YELLOW
+        f"{ai_name.upper()} THOUGHTS", thoughts_text, title_color=Fore.YELLOW
     )
 
-    # Speak the assistant's thoughts
-    if assistant_thoughts_speak:
-        if speak_mode:
-            speak(assistant_thoughts_speak)
-        else:
-            print_attribute("SPEAK", assistant_thoughts_speak, title_color=Fore.YELLOW)
+    if isinstance(thoughts, AssistantThoughts):
+        print_attribute(
+            "REASONING", remove_ansi_escape(thoughts.reasoning), title_color=Fore.YELLOW
+        )
+        if assistant_thoughts_plan := remove_ansi_escape(
+            "\n".join(f"- {p}" for p in thoughts.plan)
+        ):
+            print_attribute("PLAN", "", title_color=Fore.YELLOW)
+            # If it's a list, join it into a string
+            if isinstance(assistant_thoughts_plan, list):
+                assistant_thoughts_plan = "\n".join(assistant_thoughts_plan)
+            elif isinstance(assistant_thoughts_plan, dict):
+                assistant_thoughts_plan = str(assistant_thoughts_plan)
+
+            # Split the input_string using the newline character and dashes
+            lines = assistant_thoughts_plan.split("\n")
+            for line in lines:
+                line = line.lstrip("- ")
+                logger.info(
+                    line.strip(), extra={"title": "- ", "title_color": Fore.GREEN}
+                )
+        print_attribute(
+            "CRITICISM",
+            remove_ansi_escape(thoughts.self_criticism),
+            title_color=Fore.YELLOW,
+        )
+
+        # Speak the assistant's thoughts
+        if assistant_thoughts_speak := remove_ansi_escape(thoughts.speak):
+            if speak_mode:
+                speak(assistant_thoughts_speak)
+            else:
+                print_attribute(
+                    "SPEAK", assistant_thoughts_speak, title_color=Fore.YELLOW
+                )
+    else:
+        speak(thoughts_text)
 
 
 def remove_ansi_escape(s: str) -> str:

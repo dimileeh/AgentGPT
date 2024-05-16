@@ -1,4 +1,7 @@
 from .agent import Agent
-from .base import AgentThoughts, BaseAgent, CommandArgs, CommandName
+from .prompt_strategies.one_shot import OneShotAgentActionProposal
 
-__all__ = ["BaseAgent", "Agent", "CommandName", "CommandArgs", "AgentThoughts"]
+__all__ = [
+    "Agent",
+    "OneShotAgentActionProposal",
+]

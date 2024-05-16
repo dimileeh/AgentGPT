@@ -1,6 +1,7 @@
 import logging
 import os
 import pathlib
+from collections import defaultdict
 from io import BytesIO
 from uuid import uuid4
 
@@ -9,8 +10,11 @@ from fastapi import APIRouter, FastAPI, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
+from forge.config.config import Config
+from forge.file_storage import FileStorage
+from forge.llm.providers import ChatModelProvider, ModelProviderBudget
+from forge.models.action import ActionErrorResult, ActionSuccessResult
 from forge.sdk.db import AgentDB
-from forge.sdk.errors import NotFoundError
 from forge.sdk.middlewares import AgentMiddleware
 from forge.sdk.model import (
     Artifact,
@@ -23,6 +27,8 @@ from forge.sdk.model import (
     TaskStepsListResponse,
 )
 from forge.sdk.routes.agent_protocol import base_router
+from forge.utils.const import ASK_COMMAND, FINISH_COMMAND
+from forge.utils.exceptions import AgentFinished, NotFoundError
 from hypercorn.asyncio import serve as hypercorn_serve
 from hypercorn.config import Config as HypercornConfig
 from sentry_sdk import set_user
@@ -30,19 +36,7 @@ from sentry_sdk import set_user
 from autogpt.agent_factory.configurators import configure_agent_with_state
 from autogpt.agent_factory.generators import generate_agent_for_task
 from autogpt.agent_manager import AgentManager
-from autogpt.commands.system import finish
-from autogpt.commands.user_interaction import ask_user
-from autogpt.config import Config
-from autogpt.core.resource.model_providers import ChatModelProvider
-from autogpt.core.resource.model_providers.openai import OpenAIProvider
-from autogpt.core.resource.model_providers.schema import ModelProviderBudget
-from autogpt.file_workspace import (
-    FileWorkspace,
-    FileWorkspaceBackendName,
-    get_workspace,
-)
-from autogpt.logs.utils import fmt_kwargs
-from autogpt.models.action_history import ActionErrorResult, ActionSuccessResult
+from autogpt.app.utils import is_port_free
 
 logger = logging.getLogger(__name__)
 
@@ -54,17 +48,27 @@ class AgentProtocolServer:
         self,
         app_config: Config,
         database: AgentDB,
+        file_storage: FileStorage,
         llm_provider: ChatModelProvider,
     ):
         self.app_config = app_config
         self.db = database
+        self.file_storage = file_storage
         self.llm_provider = llm_provider
-        self.agent_manager = AgentManager(app_data_dir=app_config.app_data_dir)
-        self._task_budgets = {}
+        self.agent_manager = AgentManager(file_storage)
+        self._task_budgets = defaultdict(ModelProviderBudget)
 
     async def start(self, port: int = 8000, router: APIRouter = base_router):
         """Start the agent server."""
         logger.debug("Starting the agent server...")
+        if not is_port_free(port):
+            logger.error(f"Port {port} is already in use.")
+            logger.info(
+                "You can specify a port by either setting the AP_SERVER_PORT "
+                "environment variable or defining AP_SERVER_PORT in the .env file."
+            )
+            return
+
         config = HypercornConfig()
         config.bind = [f"localhost:{port}"]
         app = FastAPI(
@@ -134,16 +138,13 @@ class AgentProtocolServer:
         )
         logger.debug(f"Creating agent for task: '{task.input}'")
         task_agent = await generate_agent_for_task(
+            agent_id=task_agent_id(task.task_id),
             task=task.input,
             app_config=self.app_config,
+            file_storage=self.file_storage,
             llm_provider=self._get_task_llm_provider(task),
         )
-
-        # Assign an ID and a folder to the Agent and persist it
-        agent_id = task_agent.state.agent_id = task_agent_id(task.task_id)
-        logger.debug(f"New agent ID: {agent_id}")
-        task_agent.attach_fs(self.app_config.app_data_dir / "agents" / agent_id)
-        task_agent.state.save_to_json_file(task_agent.file_manager.state_file_path)
+        await task_agent.file_manager.save_state()
 
         return task
 
@@ -182,8 +183,9 @@ class AgentProtocolServer:
         # Restore Agent instance
         task = await self.get_task(task_id)
         agent = configure_agent_with_state(
-            state=self.agent_manager.retrieve_state(task_agent_id(task_id)),
+            state=self.agent_manager.load_agent_state(task_agent_id(task_id)),
             app_config=self.app_config,
+            file_storage=self.file_storage,
             llm_provider=self._get_task_llm_provider(task),
         )
 
@@ -195,7 +197,7 @@ class AgentProtocolServer:
         # To prevent this from interfering with the agent's process, we ignore the input
         #  of this first step request, and just generate the first step proposal.
         is_init_step = not bool(agent.event_history)
-        execute_command, execute_command_args, execute_result = None, None, None
+        last_proposal, tool_result = None, None
         execute_approved = False
 
         # HACK: only for compatibility with AGBenchmark
@@ -209,13 +211,11 @@ class AgentProtocolServer:
             and agent.event_history.current_episode
             and not agent.event_history.current_episode.result
         ):
-            execute_command = agent.event_history.current_episode.action.name
-            execute_command_args = agent.event_history.current_episode.action.args
+            last_proposal = agent.event_history.current_episode.action
             execute_approved = not user_input
 
             logger.debug(
-                f"Agent proposed command"
-                f" {execute_command}({fmt_kwargs(execute_command_args)})."
+                f"Agent proposed command {last_proposal.use_tool}."
                 f" User input/feedback: {repr(user_input)}"
             )
 
@@ -223,65 +223,62 @@ class AgentProtocolServer:
         step = await self.db.create_step(
             task_id=task_id,
             input=step_request,
-            is_last=execute_command == finish.__name__ and execute_approved,
+            is_last=(
+                last_proposal is not None
+                and last_proposal.use_tool.name == FINISH_COMMAND
+                and execute_approved
+            ),
         )
         agent.llm_provider = self._get_task_llm_provider(task, step.step_id)
 
         # Execute previously proposed action
-        if execute_command:
-            assert execute_command_args is not None
-            agent.workspace.on_write_file = lambda path: self._on_agent_write_file(
-                task=task, step=step, relative_path=path
+        if last_proposal:
+            agent.file_manager.workspace.on_write_file = (
+                lambda path: self._on_agent_write_file(
+                    task=task, step=step, relative_path=path
+                )
             )
 
-            if step.is_last and execute_command == finish.__name__:
-                assert execute_command_args
-
-                additional_output = {}
-                task_total_cost = agent.llm_provider.get_incurred_cost()
-                if task_total_cost > 0:
-                    additional_output["task_total_cost"] = task_total_cost
-                    logger.info(
-                        f"Total LLM cost for task {task_id}: "
-                        f"${round(task_total_cost, 2)}"
-                    )
-
-                step = await self.db.update_step(
-                    task_id=task_id,
-                    step_id=step.step_id,
-                    output=execute_command_args["reason"],
-                    additional_output=additional_output,
-                )
-                return step
-
-            if execute_command == ask_user.__name__:  # HACK
-                execute_result = ActionSuccessResult(outputs=user_input)
-                agent.event_history.register_result(execute_result)
-            elif not execute_command:
-                execute_result = None
+            if last_proposal.use_tool.name == ASK_COMMAND:
+                tool_result = ActionSuccessResult(outputs=user_input)
+                agent.event_history.register_result(tool_result)
             elif execute_approved:
                 step = await self.db.update_step(
                     task_id=task_id,
                     step_id=step.step_id,
                     status="running",
                 )
-                # Execute previously proposed action
-                execute_result = await agent.execute(
-                    command_name=execute_command,
-                    command_args=execute_command_args,
-                )
+
+                try:
+                    # Execute previously proposed action
+                    tool_result = await agent.execute(last_proposal)
+                except AgentFinished:
+                    additional_output = {}
+                    task_total_cost = agent.llm_provider.get_incurred_cost()
+                    if task_total_cost > 0:
+                        additional_output["task_total_cost"] = task_total_cost
+                        logger.info(
+                            f"Total LLM cost for task {task_id}: "
+                            f"${round(task_total_cost, 2)}"
+                        )
+
+                    step = await self.db.update_step(
+                        task_id=task_id,
+                        step_id=step.step_id,
+                        output=last_proposal.use_tool.arguments["reason"],
+                        additional_output=additional_output,
+                    )
+                    await agent.file_manager.save_state()
+                    return step
             else:
                 assert user_input
-                execute_result = await agent.execute(
-                    command_name="human_feedback",  # HACK
-                    command_args={},
-                    user_input=user_input,
-                )
+                tool_result = await agent.do_not_execute(last_proposal, user_input)
 
         # Propose next action
         try:
-            next_command, next_command_args, raw_output = await agent.propose_action()
-            logger.debug(f"AI output: {raw_output}")
+            assistant_response = await agent.propose_action()
+            next_tool_to_use = assistant_response.use_tool
+            logger.debug(f"AI output: {assistant_response.thoughts}")
         except Exception as e:
             step = await self.db.update_step(
                 task_id=task_id,
@@ -294,40 +291,44 @@ class AgentProtocolServer:
         # Format step output
         output = (
             (
-                f"`{execute_command}({fmt_kwargs(execute_command_args)})` returned:"
-                + ("\n\n" if "\n" in str(execute_result) else " ")
-                + f"{execute_result}\n\n"
+                f"`{last_proposal.use_tool}` returned:"
+                + ("\n\n" if "\n" in str(tool_result) else " ")
+                + f"{tool_result}\n\n"
             )
-            if execute_command_args and execute_command != ask_user.__name__
+            if last_proposal and last_proposal.use_tool.name != ASK_COMMAND
             else ""
         )
-        output += f"{raw_output['thoughts']['speak']}\n\n"
+        output += f"{assistant_response.thoughts.speak}\n\n"
         output += (
-            f"Next Command: {next_command}({fmt_kwargs(next_command_args)})"
-            if next_command != ask_user.__name__
-            else next_command_args["question"]
+            f"Next Command: {next_tool_to_use}"
+            if next_tool_to_use.name != ASK_COMMAND
+            else next_tool_to_use.arguments["question"]
         )
 
         additional_output = {
             **(
                 {
                     "last_action": {
-                        "name": execute_command,
-                        "args": execute_command_args,
+                        "name": last_proposal.use_tool.name,
+                        "args": last_proposal.use_tool.arguments,
                         "result": (
-                            orjson.loads(execute_result.json())
-                            if not isinstance(execute_result, ActionErrorResult)
-                            else {
-                                "error": str(execute_result.error),
-                                "reason": execute_result.reason,
-                            }
+                            ""
+                            if tool_result is None
+                            else (
+                                orjson.loads(tool_result.json())
+                                if not isinstance(tool_result, ActionErrorResult)
+                                else {
+                                    "error": str(tool_result.error),
+                                    "reason": tool_result.reason,
+                                }
+                            )
                         ),
                     },
                 }
-                if not is_init_step
+                if last_proposal and tool_result
                 else {}
             ),
-            **raw_output,
+            **assistant_response.dict(),
         }
 
         task_cumulative_cost = agent.llm_provider.get_incurred_cost()
@@ -346,7 +347,7 @@ class AgentProtocolServer:
             additional_output=additional_output,
         )
 
-        agent.state.save_to_json_file(agent.file_manager.state_file_path)
+        await agent.file_manager.save_state()
         return step
 
     async def _on_agent_write_file(
@@ -405,7 +406,7 @@ class AgentProtocolServer:
         else:
             file_path = os.path.join(relative_path, file_name)
 
-        workspace = self._get_task_agent_file_workspace(task_id, self.agent_manager)
+        workspace = self._get_task_agent_file_workspace(task_id)
         await workspace.write_file(file_path, data)
 
         artifact = await self.db.create_artifact(
@@ -421,12 +422,12 @@ class AgentProtocolServer:
         Download a task artifact by ID.
         """
         try:
+            workspace = self._get_task_agent_file_workspace(task_id)
             artifact = await self.db.get_artifact(artifact_id)
             if artifact.file_name not in artifact.relative_path:
                 file_path = os.path.join(artifact.relative_path, artifact.file_name)
             else:
                 file_path = artifact.relative_path
-            workspace = self._get_task_agent_file_workspace(task_id, self.agent_manager)
             retrieved_artifact = workspace.read_file(file_path, binary=True)
         except NotFoundError:
             raise
@@ -441,28 +442,9 @@ class AgentProtocolServer:
             },
         )
 
-    def _get_task_agent_file_workspace(
-        self,
-        task_id: str | int,
-        agent_manager: AgentManager,
-    ) -> FileWorkspace:
-        use_local_ws = (
-            self.app_config.workspace_backend == FileWorkspaceBackendName.LOCAL
-        )
+    def _get_task_agent_file_workspace(self, task_id: str | int) -> FileStorage:
         agent_id = task_agent_id(task_id)
-        workspace = get_workspace(
-            backend=self.app_config.workspace_backend,
-            id=agent_id if not use_local_ws else "",
-            root_path=agent_manager.get_agent_dir(
-                agent_id=agent_id,
-                must_exist=True,
-            )
-            / "workspace"
-            if use_local_ws
-            else None,
-        )
-        workspace.initialize()
-        return workspace
+        return self.file_storage.clone_with_subroot(f"agents/{agent_id}/workspace")
 
     def _get_task_llm_provider(
         self, task: Task, step_id: str = ""
@@ -470,9 +452,7 @@ class AgentProtocolServer:
         """
         Configures the LLM provider with headers to link outgoing requests to the task.
         """
-        task_llm_budget = self._task_budgets.get(
-            task.task_id, self.llm_provider.default_settings.budget.copy(deep=True)
-        )
+        task_llm_budget = self._task_budgets[task.task_id]
 
         task_llm_provider_config = self.llm_provider._configuration.copy(deep=True)
         _extra_request_headers = task_llm_provider_config.extra_request_headers
@@ -482,20 +462,18 @@ class AgentProtocolServer:
         if task.additional_input and (user_id := task.additional_input.get("user_id")):
             _extra_request_headers["AutoGPT-UserID"] = user_id
 
-        task_llm_provider = None
-        if isinstance(self.llm_provider, OpenAIProvider):
-            settings = self.llm_provider._settings.copy()
-            settings.budget = task_llm_budget
-            settings.configuration = task_llm_provider_config  # type: ignore
-            task_llm_provider = OpenAIProvider(
-                settings=settings,
-                logger=logger.getChild(f"Task-{task.task_id}_OpenAIProvider"),
-            )
+        settings = self.llm_provider._settings.copy()
+        settings.budget = task_llm_budget
+        settings.configuration = task_llm_provider_config
+        task_llm_provider = self.llm_provider.__class__(
+            settings=settings,
+            logger=logger.getChild(
+                f"Task-{task.task_id}_{self.llm_provider.__class__.__name__}"
+            ),
+        )
+        self._task_budgets[task.task_id] = task_llm_provider._budget  # type: ignore
 
-        if task_llm_provider and task_llm_provider._budget:
-            self._task_budgets[task.task_id] = task_llm_provider._budget
-
-        return task_llm_provider or self.llm_provider
+        return task_llm_provider
 
 
 def task_agent_id(task_id: str | int) -> str:

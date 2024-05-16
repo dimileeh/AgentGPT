@@ -2,57 +2,71 @@ from __future__ import annotations
 
 import inspect
 import logging
-import time
 from datetime import datetime
 from typing import TYPE_CHECKING, Optional
 
-if TYPE_CHECKING:
-    from autogpt.config import Config
-    from autogpt.models.command_registry import CommandRegistry
-
 import sentry_sdk
-from pydantic import Field
-
-from autogpt.core.configuration import Configurable
-from autogpt.core.prompting import ChatPrompt
-from autogpt.core.resource.model_providers import (
-    AssistantChatMessage,
+from forge.agent.base import BaseAgent, BaseAgentConfiguration, BaseAgentSettings
+from forge.agent.protocols import (
+    AfterExecute,
+    AfterParse,
+    CommandProvider,
+    DirectiveProvider,
+    MessageProvider,
+)
+from forge.command.command import Command, CommandOutput
+from forge.components.action_history import (
+    ActionHistoryComponent,
+    EpisodicActionHistory,
+)
+from forge.components.code_executor.code_executor import CodeExecutorComponent
+from forge.components.context.context import AgentContext, ContextComponent
+from forge.components.file_manager import FileManagerComponent
+from forge.components.git_operations import GitOperationsComponent
+from forge.components.image_gen import ImageGeneratorComponent
+from forge.components.system import SystemComponent
+from forge.components.user_interaction import UserInteractionComponent
+from forge.components.watchdog import WatchdogComponent
+from forge.components.web import WebSearchComponent, WebSeleniumComponent
+from forge.file_storage.base import FileStorage
+from forge.llm.prompting.schema import ChatPrompt
+from forge.llm.providers import (
+    AssistantFunctionCall,
     ChatMessage,
     ChatModelProvider,
+    ChatModelResponse,
 )
-from autogpt.llm.api_manager import ApiManager
-from autogpt.logs.log_cycle import (
-    CURRENT_CONTEXT_FILE_NAME,
-    NEXT_ACTION_FILE_NAME,
-    USER_INPUT_FILE_NAME,
-    LogCycleHandler,
-)
-from autogpt.logs.utils import fmt_kwargs
-from autogpt.models.action_history import (
-    Action,
+from forge.llm.providers.utils import function_specs_from_commands
+from forge.models.action import (
     ActionErrorResult,
     ActionInterruptedByHuman,
     ActionResult,
     ActionSuccessResult,
 )
-from autogpt.models.command import CommandOutput
-from autogpt.models.context_item import ContextItem
-
-from .base import BaseAgent, BaseAgentConfiguration, BaseAgentSettings
-from .features.context import ContextMixin
-from .features.file_workspace import FileWorkspaceMixin
-from .features.watchdog import WatchdogMixin
-from .prompt_strategies.one_shot import (
-    OneShotAgentPromptConfiguration,
-    OneShotAgentPromptStrategy,
-)
-from .utils.exceptions import (
+from forge.models.config import Configurable
+from forge.utils.exceptions import (
     AgentException,
     AgentTerminated,
     CommandExecutionError,
-    DuplicateOperationError,
     UnknownCommandError,
 )
+from pydantic import Field
+
+from autogpt.app.log_cycle import (
+    CURRENT_CONTEXT_FILE_NAME,
+    NEXT_ACTION_FILE_NAME,
+    USER_INPUT_FILE_NAME,
+    LogCycleHandler,
+)
+from autogpt.core.runner.client_lib.logging.helpers import dump_prompt
+
+from .prompt_strategies.one_shot import (
+    OneShotAgentActionProposal,
+    OneShotAgentPromptStrategy,
+)
+
+if TYPE_CHECKING:
+    from forge.config.config import Config
 
 logger = logging.getLogger(__name__)
 
@@ -63,46 +77,67 @@ class AgentConfiguration(BaseAgentConfiguration):
 
 class AgentSettings(BaseAgentSettings):
     config: AgentConfiguration = Field(default_factory=AgentConfiguration)
-    prompt_config: OneShotAgentPromptConfiguration = Field(
-        default_factory=(
-            lambda: OneShotAgentPromptStrategy.default_configuration.copy(deep=True)
-        )
+
+    history: EpisodicActionHistory[OneShotAgentActionProposal] = Field(
+        default_factory=EpisodicActionHistory[OneShotAgentActionProposal]
     )
+    """(STATE) The action history of the agent."""
+
+    context: AgentContext = Field(default_factory=AgentContext)
 
 
-class Agent(
-    ContextMixin,
-    FileWorkspaceMixin,
-    WatchdogMixin,
-    BaseAgent,
-    Configurable[AgentSettings],
-):
-    """AutoGPT's primary Agent; uses one-shot prompting."""
-
+class Agent(BaseAgent, Configurable[AgentSettings]):
     default_settings: AgentSettings = AgentSettings(
         name="Agent",
-        description=__doc__,
+        description=__doc__ if __doc__ else "",
     )
-
-    prompt_strategy: OneShotAgentPromptStrategy
 
     def __init__(
         self,
         settings: AgentSettings,
         llm_provider: ChatModelProvider,
-        command_registry: CommandRegistry,
+        file_storage: FileStorage,
         legacy_config: Config,
     ):
-        prompt_strategy = OneShotAgentPromptStrategy(
-            configuration=settings.prompt_config,
-            logger=logger,
+        super().__init__(settings)
+
+        self.llm_provider = llm_provider
+        self.ai_profile = settings.ai_profile
+        self.directives = settings.directives
+        prompt_config = OneShotAgentPromptStrategy.default_configuration.copy(deep=True)
+        prompt_config.use_functions_api = (
+            settings.config.use_functions_api
+            # Anthropic currently doesn't support tools + prefilling :(
+            and self.llm.provider_name != "anthropic"
         )
-        super().__init__(
-            settings=settings,
-            llm_provider=llm_provider,
-            prompt_strategy=prompt_strategy,
-            command_registry=command_registry,
-            legacy_config=legacy_config,
+        self.prompt_strategy = OneShotAgentPromptStrategy(prompt_config, logger)
+        self.commands: list[Command] = []
+
+        # Components
+        self.system = SystemComponent(legacy_config, settings.ai_profile)
+        self.history = ActionHistoryComponent(
+            settings.history,
+            self.send_token_limit,
+            lambda x: self.llm_provider.count_tokens(x, self.llm.name),
+            legacy_config,
+            llm_provider,
+        ).run_after(WatchdogComponent)
+        self.user_interaction = UserInteractionComponent(legacy_config)
+        self.file_manager = FileManagerComponent(settings, file_storage)
+        self.code_executor = CodeExecutorComponent(
+            self.file_manager.workspace,
+            settings,
+            legacy_config,
+        )
+        self.git_ops = GitOperationsComponent(legacy_config)
+        self.image_gen = ImageGeneratorComponent(
+            self.file_manager.workspace, legacy_config
+        )
+        self.web_search = WebSearchComponent(legacy_config)
+        self.web_selenium = WebSeleniumComponent(legacy_config, llm_provider, self.llm)
+        self.context = ContextComponent(self.file_manager.workspace, settings.context)
+        self.watchdog = WatchdogComponent(settings.config, settings.history).run_after(
+            ContextComponent
         )
 
         self.created_at = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -111,210 +146,153 @@ class Agent(
         self.log_cycle_handler = LogCycleHandler()
         """LogCycleHandler for structured debug logging."""
 
-    def build_prompt(
-        self,
-        *args,
-        extra_messages: Optional[list[ChatMessage]] = None,
-        include_os_info: Optional[bool] = None,
-        **kwargs,
-    ) -> ChatPrompt:
-        if not extra_messages:
-            extra_messages = []
+        self.event_history = settings.history
+        self.legacy_config = legacy_config
 
-        # Clock
-        extra_messages.append(
-            ChatMessage.system(f"The current time and date is {time.strftime('%c')}"),
+    async def propose_action(self) -> OneShotAgentActionProposal:
+        """Proposes the next action to execute, based on the task and current state.
+
+        Returns:
+            The command name and arguments, if any, and the agent's thoughts.
+        """
+        self.reset_trace()
+
+        # Get directives
+        resources = await self.run_pipeline(DirectiveProvider.get_resources)
+        constraints = await self.run_pipeline(DirectiveProvider.get_constraints)
+        best_practices = await self.run_pipeline(DirectiveProvider.get_best_practices)
+
+        directives = self.state.directives.copy(deep=True)
+        directives.resources += resources
+        directives.constraints += constraints
+        directives.best_practices += best_practices
+
+        # Get commands
+        self.commands = await self.run_pipeline(CommandProvider.get_commands)
+        self._remove_disabled_commands()
+
+        # Get messages
+        messages = await self.run_pipeline(MessageProvider.get_messages)
+
+        prompt: ChatPrompt = self.prompt_strategy.build_prompt(
+            messages=messages,
+            task=self.state.task,
+            ai_profile=self.state.ai_profile,
+            ai_directives=directives,
+            commands=function_specs_from_commands(self.commands),
+            include_os_info=self.legacy_config.execute_local_commands,
         )
-
-        # Add budget information (if any) to prompt
-        api_manager = ApiManager()
-        if api_manager.get_total_budget() > 0.0:
-            remaining_budget = (
-                api_manager.get_total_budget() - api_manager.get_total_cost()
-            )
-            if remaining_budget < 0:
-                remaining_budget = 0
-
-            budget_msg = ChatMessage.system(
-                f"Your remaining API budget is ${remaining_budget:.3f}"
-                + (
-                    " BUDGET EXCEEDED! SHUT DOWN!\n\n"
-                    if remaining_budget == 0
-                    else " Budget very nearly exceeded! Shut down gracefully!\n\n"
-                    if remaining_budget < 0.005
-                    else " Budget nearly exceeded. Finish up.\n\n"
-                    if remaining_budget < 0.01
-                    else ""
-                ),
-            )
-            logger.debug(budget_msg)
-            extra_messages.append(budget_msg)
-
-        if include_os_info is None:
-            include_os_info = self.legacy_config.execute_local_commands
-
-        return super().build_prompt(
-            *args,
-            extra_messages=extra_messages,
-            include_os_info=include_os_info,
-            **kwargs,
-        )
-
-    def on_before_think(self, *args, **kwargs) -> ChatPrompt:
-        prompt = super().on_before_think(*args, **kwargs)
 
         self.log_cycle_handler.log_count_within_cycle = 0
         self.log_cycle_handler.log_cycle(
-            self.ai_profile.ai_name,
+            self.state.ai_profile.ai_name,
             self.created_at,
             self.config.cycle_count,
             prompt.raw(),
             CURRENT_CONTEXT_FILE_NAME,
         )
-        return prompt
 
-    def parse_and_process_response(
-        self, llm_response: AssistantChatMessage, *args, **kwargs
-    ) -> Agent.ThoughtProcessOutput:
-        for plugin in self.config.plugins:
-            if not plugin.can_handle_post_planning():
-                continue
-            llm_response.content = plugin.post_planning(llm_response.content or "")
+        logger.debug(f"Executing prompt:\n{dump_prompt(prompt)}")
+        output = await self.complete_and_parse(prompt)
+        self.config.cycle_count += 1
 
-        (
-            command_name,
-            arguments,
-            assistant_reply_dict,
-        ) = self.prompt_strategy.parse_response_content(llm_response)
+        return output
 
-        # Check if command_name and arguments are already in the event_history
-        if self.event_history.matches_last_command(command_name, arguments):
-            raise DuplicateOperationError(
-                f"The command {command_name} with arguments {arguments} "
-                f"has been just executed."
-            )
+    async def complete_and_parse(
+        self, prompt: ChatPrompt, exception: Optional[Exception] = None
+    ) -> OneShotAgentActionProposal:
+        if exception:
+            prompt.messages.append(ChatMessage.system(f"Error: {exception}"))
+
+        response: ChatModelResponse[
+            OneShotAgentActionProposal
+        ] = await self.llm_provider.create_chat_completion(
+            prompt.messages,
+            model_name=self.llm.name,
+            completion_parser=self.prompt_strategy.parse_response_content,
+            functions=prompt.functions,
+            prefill_response=prompt.prefill_response,
+        )
+        result = response.parsed_result
 
         self.log_cycle_handler.log_cycle(
-            self.ai_profile.ai_name,
+            self.state.ai_profile.ai_name,
             self.created_at,
             self.config.cycle_count,
-            assistant_reply_dict,
+            result.thoughts.dict(),
             NEXT_ACTION_FILE_NAME,
         )
 
-        if command_name:
-            self.event_history.register_action(
-                Action(
-                    name=command_name,
-                    args=arguments,
-                    reasoning=assistant_reply_dict["thoughts"]["reasoning"],
-                )
-            )
-
-        return command_name, arguments, assistant_reply_dict
-
-    async def execute(
-        self,
-        command_name: str,
-        command_args: dict[str, str] = {},
-        user_input: str = "",
-    ) -> ActionResult:
-        result: ActionResult
-
-        if command_name == "human_feedback":
-            result = ActionInterruptedByHuman(feedback=user_input)
-            self.log_cycle_handler.log_cycle(
-                self.ai_profile.ai_name,
-                self.created_at,
-                self.config.cycle_count,
-                user_input,
-                USER_INPUT_FILE_NAME,
-            )
-
-        else:
-            for plugin in self.config.plugins:
-                if not plugin.can_handle_pre_command():
-                    continue
-                command_name, command_args = plugin.pre_command(
-                    command_name, command_args
-                )
-
-            try:
-                return_value = await execute_command(
-                    command_name=command_name,
-                    arguments=command_args,
-                    agent=self,
-                )
-
-                # Intercept ContextItem if one is returned by the command
-                if type(return_value) is tuple and isinstance(
-                    return_value[1], ContextItem
-                ):
-                    context_item = return_value[1]
-                    return_value = return_value[0]
-                    logger.debug(
-                        f"Command {command_name} returned a ContextItem: {context_item}"
-                    )
-                    self.context.add(context_item)
-
-                result = ActionSuccessResult(outputs=return_value)
-            except AgentTerminated:
-                raise
-            except AgentException as e:
-                result = ActionErrorResult.from_exception(e)
-                logger.warning(
-                    f"{command_name}({fmt_kwargs(command_args)}) raised an error: {e}"
-                )
-                sentry_sdk.capture_exception(e)
-
-            result_tlength = self.llm_provider.count_tokens(str(result), self.llm.name)
-            if result_tlength > self.send_token_limit // 3:
-                result = ActionErrorResult(
-                    reason=f"Command {command_name} returned too much output. "
-                    "Do not execute this command again with the same arguments."
-                )
-
-            for plugin in self.config.plugins:
-                if not plugin.can_handle_post_command():
-                    continue
-                if result.status == "success":
-                    result.outputs = plugin.post_command(command_name, result.outputs)
-                elif result.status == "error":
-                    result.reason = plugin.post_command(command_name, result.reason)
-
-        # Update action history
-        self.event_history.register_result(result)
-        await self.event_history.handle_compression(
-            self.llm_provider, self.legacy_config
-        )
+        await self.run_pipeline(AfterParse.after_parse, result)
 
         return result
 
+    async def execute(
+        self,
+        proposal: OneShotAgentActionProposal,
+        user_feedback: str = "",
+    ) -> ActionResult:
+        tool = proposal.use_tool
 
-#############
-# Utilities #
-#############
+        # Get commands
+        self.commands = await self.run_pipeline(CommandProvider.get_commands)
+        self._remove_disabled_commands()
 
-
-async def execute_command(
-    command_name: str,
-    arguments: dict[str, str],
-    agent: Agent,
-) -> CommandOutput:
-    """Execute the command and return the result
-
-    Args:
-        command_name (str): The name of the command to execute
-        arguments (dict): The arguments for the command
-        agent (Agent): The agent that is executing the command
-
-    Returns:
-        str: The result of the command
-    """
-    # Execute a native command with the same name or alias, if it exists
-    if command := agent.command_registry.get_command(command_name):
         try:
-            result = command(**arguments, agent=agent)
+            return_value = await self._execute_tool(tool)
+
+            result = ActionSuccessResult(outputs=return_value)
+        except AgentTerminated:
+            raise
+        except AgentException as e:
+            result = ActionErrorResult.from_exception(e)
+            logger.warning(f"{tool} raised an error: {e}")
+            sentry_sdk.capture_exception(e)
+
+        result_tlength = self.llm_provider.count_tokens(str(result), self.llm.name)
+        if result_tlength > self.send_token_limit // 3:
+            result = ActionErrorResult(
+                reason=f"Command {tool.name} returned too much output. "
+                "Do not execute this command again with the same arguments."
+            )
+
+        await self.run_pipeline(AfterExecute.after_execute, result)
+
+        logger.debug("\n".join(self.trace))
+
+        return result
+
+    async def do_not_execute(
+        self, denied_proposal: OneShotAgentActionProposal, user_feedback: str
+    ) -> ActionResult:
+        result = ActionInterruptedByHuman(feedback=user_feedback)
+        self.log_cycle_handler.log_cycle(
+            self.state.ai_profile.ai_name,
+            self.created_at,
+            self.config.cycle_count,
+            user_feedback,
+            USER_INPUT_FILE_NAME,
+        )
+
+        await self.run_pipeline(AfterExecute.after_execute, result)
+
+        logger.debug("\n".join(self.trace))
+
+        return result
+
+    async def _execute_tool(self, tool_call: AssistantFunctionCall) -> CommandOutput:
+        """Execute the command and return the result
+
+        Args:
+            tool_call (AssistantFunctionCall): The tool call to execute
+
+        Returns:
+            str: The execution result
+        """
+        # Execute a native command with the same name or alias, if it exists
+        command = self._get_command(tool_call.name)
+        try:
+            result = command(**tool_call.arguments)
             if inspect.isawaitable(result):
                 return await result
             return result
@@ -323,20 +301,31 @@ async def execute_command(
         except Exception as e:
             raise CommandExecutionError(str(e))
 
-    # Handle non-native commands (e.g. from plugins)
-    if agent._prompt_scratchpad:
-        for name, command in agent._prompt_scratchpad.commands.items():
-            if (
-                command_name == name
-                or command_name.lower() == command.description.lower()
-            ):
-                try:
-                    return command.method(**arguments)
-                except AgentException:
-                    raise
-                except Exception as e:
-                    raise CommandExecutionError(str(e))
+    def _get_command(self, command_name: str) -> Command:
+        for command in reversed(self.commands):
+            if command_name in command.names:
+                return command
 
-    raise UnknownCommandError(
-        f"Cannot execute command '{command_name}': unknown command."
-    )
+        raise UnknownCommandError(
+            f"Cannot execute command '{command_name}': unknown command."
+        )
+
+    def _remove_disabled_commands(self) -> None:
+        self.commands = [
+            command
+            for command in self.commands
+            if not any(
+                name in self.legacy_config.disabled_commands for name in command.names
+            )
+        ]
+
+    def find_obscured_commands(self) -> list[Command]:
+        seen_names = set()
+        obscured_commands = []
+        for command in reversed(self.commands):
+            # If all of the command's names have been seen, it's obscured
+            if seen_names.issuperset(command.names):
+                obscured_commands.append(command)
+            else:
+                seen_names.update(command.names)
+        return list(reversed(obscured_commands))

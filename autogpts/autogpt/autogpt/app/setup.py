@@ -2,9 +2,12 @@
 import logging
 from typing import Optional
 
-from autogpt.app.utils import clean_input
-from autogpt.config import AIDirectives, AIProfile, Config
-from autogpt.logs.helpers import print_attribute
+from forge.config.ai_directives import AIDirectives
+from forge.config.ai_profile import AIProfile
+from forge.config.config import Config
+from forge.logging.helpers import print_attribute
+
+from .input import clean_input
 
 logger = logging.getLogger(__name__)
 
@@ -69,22 +72,18 @@ async def interactively_revise_ai_settings(
         )
 
         if (
-            await clean_input(app_config, "Continue with these settings? [Y/n]")
+            clean_input("Continue with these settings? [Y/n]").lower()
             or app_config.authorise_key
         ) == app_config.authorise_key:
             break
 
         # Ask for revised ai_profile
         ai_profile.ai_name = (
-            await clean_input(
-                app_config, "Enter AI name (or press enter to keep current):"
-            )
+            clean_input("Enter AI name (or press enter to keep current):")
             or ai_profile.ai_name
         )
         ai_profile.ai_role = (
-            await clean_input(
-                app_config, "Enter new AI role (or press enter to keep current):"
-            )
+            clean_input("Enter new AI role (or press enter to keep current):")
             or ai_profile.ai_role
         )
 
@@ -94,8 +93,7 @@ async def interactively_revise_ai_settings(
             constraint = directives.constraints[i]
             print_attribute(f"Constraint {i+1}:", f'"{constraint}"')
             new_constraint = (
-                await clean_input(
-                    app_config,
+                clean_input(
                     f"Enter new constraint {i+1}"
                     " (press enter to keep current, or '-' to remove):",
                 )
@@ -112,8 +110,7 @@ async def interactively_revise_ai_settings(
 
         # Add new constraints
         while True:
-            new_constraint = await clean_input(
-                app_config,
+            new_constraint = clean_input(
                 "Press enter to finish, or enter a constraint to add:",
             )
             if not new_constraint:
@@ -126,8 +123,7 @@ async def interactively_revise_ai_settings(
             resource = directives.resources[i]
             print_attribute(f"Resource {i+1}:", f'"{resource}"')
             new_resource = (
-                await clean_input(
-                    app_config,
+                clean_input(
                     f"Enter new resource {i+1}"
                     " (press enter to keep current, or '-' to remove):",
                 )
@@ -143,8 +139,7 @@ async def interactively_revise_ai_settings(
 
         # Add new resources
         while True:
-            new_resource = await clean_input(
-                app_config,
+            new_resource = clean_input(
                 "Press enter to finish, or enter a resource to add:",
             )
             if not new_resource:
@@ -157,8 +152,7 @@ async def interactively_revise_ai_settings(
             best_practice = directives.best_practices[i]
             print_attribute(f"Best Practice {i+1}:", f'"{best_practice}"')
             new_best_practice = (
-                await clean_input(
-                    app_config,
+                clean_input(
                     f"Enter new best practice {i+1}"
                     " (press enter to keep current, or '-' to remove):",
                 )
@@ -174,8 +168,7 @@ async def interactively_revise_ai_settings(
 
         # Add new best practices
         while True:
-            new_best_practice = await clean_input(
-                app_config,
+            new_best_practice = clean_input(
                 "Press enter to finish, or add a best practice to add:",
             )
             if not new_best_practice:

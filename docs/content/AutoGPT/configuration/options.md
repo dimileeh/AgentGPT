@@ -7,11 +7,12 @@ Configuration is controlled through the `Config` object. You can set configurati
 - `AI_SETTINGS_FILE`: Location of the AI Settings file relative to the AutoGPT root directory. Default: ai_settings.yaml
 - `AUDIO_TO_TEXT_PROVIDER`: Audio To Text Provider. Only option currently is `huggingface`. Default: huggingface
 - `AUTHORISE_COMMAND_KEY`: Key response accepted when authorising commands. Default: y
+- `ANTHROPIC_API_KEY`: Set this if you want to use Anthropic models with AutoGPT
 - `AZURE_CONFIG_FILE`: Location of the Azure Config file relative to the AutoGPT root directory. Default: azure.yaml
 - `BROWSE_CHUNK_MAX_LENGTH`: When browsing website, define the length of chunks to summarize. Default: 3000
 - `BROWSE_SPACY_LANGUAGE_MODEL`: [spaCy language model](https://spacy.io/usage/models) to use when creating chunks. Default: en_core_web_sm
 - `CHAT_MESSAGES_ENABLED`: Enable chat messages. Optional
-- `DISABLED_COMMAND_CATEGORIES`: Command categories to disable. Command categories are Python module names, e.g. autogpt.commands.execute_code. See the directory `autogpt/commands` in the source for all command modules. Default: None
+- `DISABLED_COMMANDS`: Commands to disable. Use comma separated names of commands. See the list of commands from built-in components [here](../components/components.md). Default: None
 - `ELEVENLABS_API_KEY`: ElevenLabs API Key. Optional.
 - `ELEVENLABS_VOICE_ID`: ElevenLabs Voice ID. Optional.
 - `EMBEDDING_MODEL`: LLM Model to use for embedding tasks. Default: `text-embedding-3-small`
@@ -33,7 +34,6 @@ Configuration is controlled through the `Config` object. You can set configurati
 - `OPENAI_API_KEY`: *REQUIRED*- Your [OpenAI API Key](https://platform.openai.com/account/api-keys).
 - `OPENAI_ORGANIZATION`: Organization ID in OpenAI. Optional.
 - `PLAIN_OUTPUT`: Plain output, which disables the spinner. Default: False
-- `PLUGINS_CONFIG_FILE`: Path of the Plugins Config file relative to the AutoGPT root directory. Default: plugins_config.yaml
 - `PROMPT_SETTINGS_FILE`: Location of the Prompt Settings file relative to the AutoGPT root directory. Default: prompt_settings.yaml
 - `REDIS_HOST`: Redis Host. Default: localhost
 - `REDIS_PASSWORD`: Redis Password. Optional. Default:
