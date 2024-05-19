@@ -1,0 +1,25 @@
+version: "3.9"
+services:
+  auto-gpt:
+    image: significantgravitas/auto-gpt
+    env_file:
+      - .env
+    ports:
+      - "8000:8000"  # remove this if you just want to run a single agent in TTY mode
+    profiles: ["exclude-from-up"]
+    volumes:
+      - ./data:/app/data
+      ## allow auto-gpt to write logs to disk
+      - ./logs:/app/logs
+      - ./frontend:/frontend
+      ## uncomment following lines if you want to make use of these files
+      ## you must have them existing in the same folder as this docker-compose.yml
+      - type: bind
+        source: ./ai_settings.yaml
+        target: /app/ai_settings.yaml
+      - type: bind
+        source: ./plugins_config.yaml
+        target: /app/plugins_config.yaml
+#      - type: bind
+#        source: ./prompt_settings.yaml
+#        target: /app/prompt_settings.yaml
